@@ -41,12 +41,18 @@ fn run() -> Result<()> {
             print_json(&serde_json::json!({ "ok": true, "session": "noop" }))?;
         }
         Command::SessionEnd => {
-            print_json(&serde_json::json!({ "ok": true, "ended": true }))?;
+            println!(r#"{{"ok":true,"ended":false,"daemon":"none"}}"#);
+        }
+        // No session means no grant to forget: the contract's fixed answer for
+        // bridges with `session_supported:false`. No side effects.
+        Command::ForgetSession => {
+            println!(
+                r#"{{"ok":true,"ended":false,"daemon":"none","token_removed":false,"token_path":null}}"#
+            );
         }
 
         Command::Doctor => {
-            let conn = Conn::connect()?;
-            print_json(&doctor::doctor(&conn))?;
+            print_json(&doctor::doctor())?;
         }
         Command::Screens => {
             let conn = Conn::connect()?;

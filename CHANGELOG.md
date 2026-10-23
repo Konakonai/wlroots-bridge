@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **CLI contract v1.** `doctor` always exits 0 and reports the contract keys
+  (`contract`, `bridge`, `version`, `backend`, `session_match`,
+  `backend_reachable`, `backend_error`, `session_supported`, ...) with the old
+  keys as extras when a compositor answers; `session-end` reports
+  `ended:false, daemon:"none"`; new `forget-session`; `tests/contract.rs`.
+
 ### Fixed
 
 - **Pointer on layouts that do not start at `(0,0)`.** Absolute motion now maps

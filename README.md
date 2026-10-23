@@ -111,7 +111,7 @@ failure it prints a message to stderr and exits 1 (clap parse errors exit 2).
 
 | Subcommand | Purpose |
 |---|---|
-| `doctor` | Wayland env + which globals the compositor advertises |
+| `doctor` | Contract v1 report (always exit 0) + Wayland env and advertised globals |
 | `screens` | Enumerate outputs (wl_output + xdg-output) |
 | `windows` | Enumerate windows (foreign-toplevel) |
 | `screenshot [--display N]` | Capture a full monitor |
@@ -125,7 +125,7 @@ failure it prints a message to stderr and exits 1 (clap parse errors exit 2).
 | `app-under-point --x --y` | Unsupported on Wayland (returns null) |
 | `cursor-position` | Unsupported on Wayland (exits 1) |
 | `activate-window --window <id>` | Raise + focus a window (wlr foreign-toplevel; works on Sway/Hyprland/Niri) |
-| `session-start` / `session-end` | No-ops (report `{"ok":true}`) |
+| `session-start` / `session-end` / `forget-session` | No-ops (`session-start` -> `{"ok":true,"session":"noop"}`; the others report `ended:false, daemon:"none"`) |
 
 ```sh
 wlroots-bridge doctor
@@ -140,6 +140,17 @@ wlroots-bridge type --text 'hello' --delay-ms 12
 See [DESIGN.md](DESIGN.md) for the full subcommand -> JSON output contract, the
 key-spec grammar, the coordinate system, the held-button mechanism, the keymap
 generation approach, and the wlroots-specific contract deviations.
+
+## CLI contract v1
+
+The CLI follows the Computer Use bridge CLI contract v1 of claude-desktop-extra:
+[docs/computer-use-bridge-contract.md](https://github.com/patrickjaja/claude-desktop-extra/blob/master/docs/computer-use-bridge-contract.md).
+`doctor` always exits 0 and reports the required keys (`contract`, `bridge`,
+`version`, `backend`, `session_match`, `backend_reachable`, `backend_error`,
+`session_supported`, ...), with the compositor details as extras when reachable.
+`session-end` and `forget-session` report `ended:false, daemon:"none"` (this
+bridge has no session daemon or grant), and every coordinate flag accepts
+negative values.
 
 ## Bundling into claude-desktop-extra
 

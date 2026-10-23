@@ -125,6 +125,8 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         foreground: bool,
     },
-    /// End a session lock. On Wayland this is a no-op that reports success.
+    /// End a session lock. On Wayland there is no daemon: reports `ended:false`.
     SessionEnd,
+    /// Forget the remembered screen-sharing grant. Nothing to forget on wlroots.
+    ForgetSession,
 }

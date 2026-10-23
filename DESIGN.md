@@ -62,7 +62,7 @@ snake_case.
 
 | Subcommand | Output shape | JS reader (evidence) |
 |---|---|---|
-| `doctor` | `{wayland_display, compositor, globals:{virtual_pointer, virtual_keyboard, screencopy, foreign_toplevel_wlr, foreign_toplevel_ext, xdg_output, wl_output_count, wl_seat, wl_shm}}` | human-facing only; not parsed by JS |
+| `doctor` | contract v1 keys (see below) plus, when the compositor is reachable, `{wayland_display, compositor, globals:{virtual_pointer, virtual_keyboard, screencopy, foreign_toplevel_wlr, foreign_toplevel_ext, xdg_output, wl_output_count, wl_seat, wl_shm}}` | always exit 0 |
 | `screens` | `[{id, name, geometry:{x,y,width,height}, scale, refresh_millihz, is_active, is_primary}]` | `mapRustScreenToDisplay` reads `geometry.*`, `scale`, `is_primary`, `name`, `id` (-> `_bridgeId`) |
 | `screenshot [--display N]` | `{base64, width, height, displayWidth, displayHeight, displayId, originX, originY}` (camelCase) | `screenshotResultFromRust` reads `result.displayWidth`/`displayHeight`/`originX`/`originY` |
 | `zoom --x --y --w --h [--display N]` | `{base64, width, height}` | `zoom` reads `result.base64`/`width`/`height` |
@@ -228,6 +228,29 @@ globals disappear from the registry, which `doctor` would surface.
 without input focus. The command exits 1 with a clean error. The JS executor
 uses Electron's `getCursorScreenPoint()` on this path anyway, so this is never a
 functional gap.
+
+## CLI contract v1
+
+The bridge implements the Computer Use bridge CLI contract v1
+(<https://github.com/patrickjaja/claude-desktop-extra/blob/master/docs/computer-use-bridge-contract.md>).
+
+- `doctor` always exits 0. Required keys: `contract:1`, `bridge:"wlroots-bridge"`,
+  `version`, `backend:"wlroots"`, `session_match`, `backend_reachable`,
+  `backend_error`, `session_supported:false`, `restore_token_present:false`,
+  `restore_token_path:null`, `daemon_running:false`, `session_socket:null`.
+  `session_match` is true when `WAYLAND_DISPLAY` is set, the connection works and
+  the compositor advertises `zwlr_virtual_pointer_manager_v1`,
+  `zwp_virtual_keyboard_manager_v1` and `zwlr_screencopy_manager_v1`. The
+  desktop app additionally gates its wlroots tier on `SWAYSOCK` /
+  `HYPRLAND_INSTANCE_SIGNATURE` / `NIRI_SOCKET`; the bridge does not, so a
+  protocol-capable compositor outside those three still reports a match.
+- `session-start` -> `{"ok":true,"session":"noop"}`; `session-end` ->
+  `{"ok":true,"ended":false,"daemon":"none"}`; `forget-session` ->
+  `{"ok":true,"ended":false,"daemon":"none","token_removed":false,"token_path":null}`.
+  There is no daemon and no grant, so none of them has side effects.
+- Every coordinate flag accepts negative values (layouts can start left of or
+  above the origin).
+- `tests/contract.rs` runs these checks against the binary without a compositor.
 
 ## Error contract
 

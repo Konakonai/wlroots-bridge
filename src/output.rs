@@ -193,9 +193,26 @@ pub struct TypeActionResult {
 /// never parses `doctor`).
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
-    pub wayland_display: String,
-    pub compositor: String,
-    pub globals: DoctorGlobals,
+    // CLI contract v1 required keys (see DESIGN.md "CLI contract v1").
+    pub contract: u32,
+    pub bridge: &'static str,
+    pub version: &'static str,
+    pub backend: &'static str,
+    pub session_match: bool,
+    pub backend_reachable: bool,
+    pub backend_error: Option<String>,
+    pub session_supported: bool,
+    pub restore_token_present: bool,
+    pub restore_token_path: Option<String>,
+    pub daemon_running: bool,
+    pub session_socket: Option<String>,
+    // Bridge-specific extras, present only when the compositor was reachable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wayland_display: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compositor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub globals: Option<DoctorGlobals>,
 }
 
 /// Presence + bound version of each global we depend on. `Some(v)` = advertised
