@@ -17,6 +17,7 @@ use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zx
 
 use crate::conn::{Conn, OutputEntry};
 use crate::output::{Rect, Screen};
+use crate::transform::Transform;
 
 /// Per-output accumulator during the enumeration roundtrip.
 struct ScreenState {
@@ -52,6 +53,11 @@ impl Dispatch<wl_output::WlOutput, ()> for ScreenState {
         };
         match event {
             wl_output::Event::Scale { factor } => entry.scale = factor,
+            wl_output::Event::Geometry { transform, .. } => {
+                if let Ok(t) = transform.into_result() {
+                    entry.transform = Transform::from_raw(u32::from(t));
+                }
+            }
             wl_output::Event::Name { name } => entry.name = Some(name),
             wl_output::Event::Mode {
                 flags,
@@ -128,6 +134,7 @@ pub fn enumerate(conn: &Conn) -> Result<Vec<OutputEntry>> {
             mode_width: None,
             mode_height: None,
             refresh_millihz: None,
+            transform: Transform::Normal,
         });
         let _ = index;
     }
@@ -169,6 +176,7 @@ pub struct OutputGeometry {
     pub mode_width: Option<i32>,
     pub mode_height: Option<i32>,
     pub refresh_millihz: Option<u32>,
+    pub transform: Transform,
 }
 
 impl OutputGeometry {
@@ -184,6 +192,17 @@ impl OutputGeometry {
             mode_width: entry.mode_width,
             mode_height: entry.mode_height,
             refresh_millihz: entry.refresh_millihz,
+            transform: entry.transform,
+        }
+    }
+
+    /// The current mode size in logical orientation: `wl_output.mode` reports
+    /// the untransformed panel size, so a 90/270 output swaps it.
+    pub fn transformed_mode(&self) -> Option<(i32, i32)> {
+        match (self.mode_width, self.mode_height) {
+            (Some(w), Some(h)) if self.transform.swaps_axes() => Some((h, w)),
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
         }
     }
 }
@@ -197,24 +216,25 @@ impl OutputGeometry {
 pub fn to_screen(geom: &OutputGeometry, is_primary: bool) -> Screen {
     let x = geom.logical_x.unwrap_or(0);
     let y = geom.logical_y.unwrap_or(0);
+    let mode = geom.transformed_mode();
 
     let (width, height) = match (geom.logical_width, geom.logical_height) {
         (Some(w), Some(h)) => (w, h),
         _ => {
-            // Derive a logical size from the physical mode and integer scale.
+            // Derive a logical size from the (transform-oriented) physical mode
+            // and the integer scale.
             let s = geom.scale.max(1);
-            (
-                geom.mode_width.unwrap_or(0) / s,
-                geom.mode_height.unwrap_or(0) / s,
-            )
+            let (mw, mh) = mode.unwrap_or((0, 0));
+            (mw / s, mh / s)
         }
     };
 
     // Prefer a fractional scale computed from physical vs logical size (this is
     // the effective scale a fractional-scaling compositor applies); fall back to
-    // the integer wl_output scale.
-    let scale = match (geom.mode_width, geom.logical_width) {
-        (Some(mode_w), Some(logical_w)) if logical_w > 0 => {
+    // the integer wl_output scale. The mode is swapped for 90/270 transforms so
+    // a rotated unscaled output reports 1.0, not height/width.
+    let scale = match (mode, geom.logical_width) {
+        (Some((mode_w, _)), Some(logical_w)) if logical_w > 0 => {
             Some((mode_w as f64) / (logical_w as f64))
         }
         _ => Some(geom.scale.max(1) as f64),
@@ -300,6 +320,7 @@ mod tests {
             mode_width: Some(mw),
             mode_height: Some((mw as f64 * lh as f64 / lw as f64) as i32),
             refresh_millihz: Some(60_000),
+            transform: Transform::Normal,
         }
     }
 
@@ -342,5 +363,51 @@ mod tests {
         let s = to_screen(&g, false);
         assert_eq!(s.name, "output-42");
         assert_eq!(s.id, "output-42");
+    }
+
+    #[test]
+    fn rotated_output_scale_uses_swapped_mode() {
+        // Unscaled 1280x720 panel rotated 90: logical 720x1280, mode 1280x720.
+        let mut g = geom("X11-2", 1280, 0, 720, 1280, 1280, 1);
+        g.mode_height = Some(720);
+        for t in [
+            Transform::Rot90,
+            Transform::Rot270,
+            Transform::Flipped90,
+            Transform::Flipped270,
+        ] {
+            g.transform = t;
+            let s = to_screen(&g, false);
+            assert!((s.scale.unwrap() - 1.0).abs() < 1e-9, "{t:?} {:?}", s.scale);
+            assert_eq!((s.geometry.width, s.geometry.height), (720, 1280));
+        }
+        // Non-swapping transforms keep the mode as-is.
+        for t in [Transform::Rot180, Transform::Flipped, Transform::Flipped180] {
+            let mut g = geom("X11-2", 0, 0, 1280, 720, 1280, 1);
+            g.transform = t;
+            assert!((to_screen(&g, false).scale.unwrap() - 1.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn rotated_fractional_scale() {
+        // 3840x2160 panel at scale 1.5 rotated 270: logical 1440x2560.
+        let mut g = geom("eDP-1", 0, 0, 1440, 2560, 3840, 2);
+        g.mode_height = Some(2160);
+        g.transform = Transform::Rot270;
+        let s = to_screen(&g, true);
+        assert!((s.scale.unwrap() - 1.5).abs() < 1e-9, "scale {:?}", s.scale);
+    }
+
+    #[test]
+    fn rotated_fallback_logical_size_swaps_mode() {
+        let mut g = geom("HDMI-1", 0, 0, 1, 1, 1920, 2);
+        g.mode_height = Some(1080);
+        g.logical_width = None;
+        g.logical_height = None;
+        g.transform = Transform::Rot90;
+        let s = to_screen(&g, false);
+        assert_eq!((s.geometry.width, s.geometry.height), (540, 960));
+        assert!((s.scale.unwrap() - 2.0).abs() < 1e-9);
     }
 }

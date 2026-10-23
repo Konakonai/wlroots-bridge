@@ -35,12 +35,18 @@ static musl binary that runs on every distro without runtime dependencies.
 All coordinates are **Wayland global logical pixels** - the same space the JS
 sends (`Math.round(x)`, `Math.round(y)`). A multi-monitor layout is one logical
 plane; a monitor's `geometry.x/y` is its offset within it (from `xdg-output`
-`logical_position`). Absolute pointer motion maps a global logical coordinate
-into the union of all outputs' logical extents (see
-[Pointer input](#pointer-input)). The `screencopy` buffer is in an output's
-**physical** pixels; `zoom` scales the requested logical region by the
-buffer/logical ratio before cropping, so fractional-scaled outputs crop
-correctly.
+`logical_position`), which can be negative for an output left of or above
+`(0,0)`. Absolute pointer motion maps a global logical coordinate into the
+layout's bounding box (see [Pointer input](#pointer-input)). The `screencopy`
+buffer is in an output's **physical** pixels and untransformed panel
+orientation; capture undoes the frame's y-invert flag, then applies the
+`wl_output.transform` (all eight: normal, 90, 180, 270, flipped, flipped-90/180/270,
+following wlroots `wlr_box_transform`), so screenshots match the output's
+logical orientation and the size `screens` reports. `zoom` then scales the
+requested logical region by the image/logical ratio before cropping, so
+fractional-scaled outputs crop correctly. The reported `scale` is the
+transform-oriented mode width over the logical width (a rotated unscaled output
+reports 1.0).
 
 Wayland has **no "primary" output**. We designate the output at logical `(0,0)`
 as primary/active; if none sits there, the first enumerated output. Both flags
@@ -137,12 +143,16 @@ expects.
 
 `zwlr_virtual_pointer_manager_v1.create_virtual_pointer` (no seat hint - the
 compositor assigns the default seat). Absolute motion uses
-`motion_absolute(time, x, y, x_extent, y_extent)` where the extents are the
-**union of all outputs' logical space** (right/bottom edge of the bounding box).
-Mapping a global logical coordinate into that full extent is what makes a single
-coordinate land correctly across a multi-monitor layout; creating the pointer
-per-output would restrict motion to one monitor. Every event group is closed
-with `frame()`.
+`motion_absolute(time, x, y, x_extent, y_extent)`. wlroots' `wlr_cursor` maps
+the normalized position onto the output layout's **bounding box, including a
+negative origin** (`lx = box.x + x / x_extent * box.w`). We therefore send
+`(x - min_x, y - min_y)` with extents `(max_x - min_x, max_y - min_y)` over all
+outputs' logical rectangles, clamped to `[0, extent - 1]`. That makes a single
+global coordinate land exactly on any monitor, including ones left of / above
+`(0,0)`, vertically offset, or separated by a gap; creating the pointer
+per-output would restrict motion to one monitor. Every absolute positioning
+(move, click, scroll, drag) goes through this mapping. Every event group is
+closed with `frame()`.
 
 - **Buttons:** evdev codes `BTN_LEFT=0x110`, `BTN_MIDDLE=0x112`,
   `BTN_RIGHT=0x111`; press+frame, release+frame.

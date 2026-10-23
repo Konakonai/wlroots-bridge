@@ -2,10 +2,13 @@
 //!
 //! Each one-shot command creates a virtual pointer, emits its events, sends a
 //! `frame`, roundtrips so the compositor processes them, then exits. Absolute
-//! motion uses `motion_absolute(time, x, y, x_extent, y_extent)` where the
-//! extents are the union of the logical output space, so a single global logical
-//! coordinate maps correctly across a multi-monitor layout (the JS sends global
-//! logical coords). Buttons use Linux evdev codes; scroll uses `axis`.
+//! motion uses `motion_absolute(time, x, y, x_extent, y_extent)`. wlroots'
+//! `wlr_cursor` maps that normalized position onto the output layout's
+//! *bounding box*, including a negative origin (`lx = box.x + x / x_extent *
+//! box.w`), so we send the global logical coordinate relative to the layout's
+//! top-left (`x - min_x`) with the box size as extent. A layout whose outputs
+//! sit left of / above (0,0), or are offset vertically, then maps exactly (the
+//! JS sends global logical coords). Buttons use Linux evdev codes; scroll uses `axis`.
 //!
 //! ## Held-button design (`left-mouse-down` / `left-mouse-up`)
 //!
@@ -88,49 +91,98 @@ struct PointerState;
 wayland_client::delegate_noop!(PointerState: ignore zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1);
 wayland_client::delegate_noop!(PointerState: ignore zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1);
 
-/// The logical bounding box of all outputs: the extent space `motion_absolute`
-/// maps into. Returns `(extent_w, extent_h)` = right/bottom edge of the union.
-fn logical_extents(conn: &Conn) -> Result<(u32, u32)> {
-    let entries = screens::enumerate(conn)?;
-    if entries.is_empty() {
-        bail!("no outputs to derive a coordinate space from");
+/// The logical bounding box of the output layout: the space wlroots maps
+/// `motion_absolute` onto. Its origin can be negative (an output left of or
+/// above (0,0)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayoutBox {
+    min_x: i64,
+    min_y: i64,
+    max_x: i64,
+    max_y: i64,
+}
+
+impl LayoutBox {
+    /// The union of `(x, y, w, h)` output rectangles (logical layout).
+    fn from_rects(rects: impl IntoIterator<Item = (i32, i32, i32, i32)>) -> Option<Self> {
+        let mut bbox: Option<Self> = None;
+        for (x, y, w, h) in rects {
+            let (x, y) = (i64::from(x), i64::from(y));
+            let (r, b) = (x + i64::from(w.max(0)), y + i64::from(h.max(0)));
+            bbox = Some(match bbox {
+                None => Self {
+                    min_x: x,
+                    min_y: y,
+                    max_x: r,
+                    max_y: b,
+                },
+                Some(o) => Self {
+                    min_x: o.min_x.min(x),
+                    min_y: o.min_y.min(y),
+                    max_x: o.max_x.max(r),
+                    max_y: o.max_y.max(b),
+                },
+            });
+        }
+        bbox
     }
-    let mut max_x = 0i64;
-    let mut max_y = 0i64;
-    for e in &entries {
+
+    /// `(x_extent, y_extent)`: the box size, at least 1.
+    fn extents(&self) -> (u32, u32) {
+        let w = (self.max_x - self.min_x).clamp(1, i64::from(u32::MAX));
+        let h = (self.max_y - self.min_y).clamp(1, i64::from(u32::MAX));
+        (w as u32, h as u32)
+    }
+
+    /// Map a global logical coordinate to the box-relative position sent with
+    /// `motion_absolute`, clamped to `[0, extent - 1]` (the last pixel of the
+    /// layout; `extent` itself would be one past the right/bottom edge).
+    fn map_point(&self, x: i32, y: i32) -> (u32, u32) {
+        let (ew, eh) = self.extents();
+        let px = (i64::from(x) - self.min_x).clamp(0, i64::from(ew) - 1);
+        let py = (i64::from(y) - self.min_y).clamp(0, i64::from(eh) - 1);
+        (px as u32, py as u32)
+    }
+}
+
+/// The logical bounding box of all outputs.
+fn layout_box(conn: &Conn) -> Result<LayoutBox> {
+    let entries = screens::enumerate(conn)?;
+    let rects = entries.iter().map(|e| {
         let g = screens::OutputGeometry::from_entry(e);
         let s = screens::to_screen(&g, false);
-        max_x = max_x.max(i64::from(s.geometry.x) + i64::from(s.geometry.width));
-        max_y = max_y.max(i64::from(s.geometry.y) + i64::from(s.geometry.height));
-    }
-    Ok((max_x.max(1) as u32, max_y.max(1) as u32))
+        (
+            s.geometry.x,
+            s.geometry.y,
+            s.geometry.width,
+            s.geometry.height,
+        )
+    });
+    LayoutBox::from_rects(rects)
+        .ok_or_else(|| anyhow::anyhow!("no outputs to derive a coordinate space from"))
 }
 
 /// A bound virtual pointer plus the extents its absolute motion maps into.
 struct Pointer {
     pointer: zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
-    extent_w: u32,
-    extent_h: u32,
+    layout: LayoutBox,
 }
 
 impl Pointer {
     fn create(conn: &Conn, qh: &QueueHandle<PointerState>) -> Result<Self> {
-        let (extent_w, extent_h) = logical_extents(conn)?;
+        let layout = layout_box(conn)?;
         let manager = conn.bind_virtual_pointer_manager(qh)?;
         // No seat hint: the compositor assigns a default seat.
         let pointer = manager.create_virtual_pointer(None, qh, ());
-        Ok(Self {
-            pointer,
-            extent_w,
-            extent_h,
-        })
+        Ok(Self { pointer, layout })
     }
 
+    /// Warp to a global logical coordinate. Every absolute positioning (move,
+    /// click, scroll, drag) goes through here.
     fn motion_absolute(&self, x: i32, y: i32) {
-        let px = x.clamp(0, self.extent_w as i32) as u32;
-        let py = y.clamp(0, self.extent_h as i32) as u32;
-        self.pointer
-            .motion_absolute(now_ms(), px, py, self.extent_w, self.extent_h);
+        let (ew, eh) = self.layout.extents();
+        let (px, py) = self.layout.map_point(x, y);
+        self.pointer.motion_absolute(now_ms(), px, py, ew, eh);
     }
 
     fn button(&self, evdev: u32, pressed: bool) {
@@ -562,5 +614,69 @@ mod tests {
     #[test]
     fn scroll_step_matches_convention() {
         assert_eq!(SCROLL_STEP, 15.0);
+    }
+
+    /// What wlroots' wlr_cursor does with a motion_absolute event: map the
+    /// normalized position onto the layout bounding box.
+    fn wlroots_lands_at(b: &LayoutBox, x: i32, y: i32) -> (f64, f64) {
+        let (ew, eh) = b.extents();
+        let (px, py) = b.map_point(x, y);
+        (
+            b.min_x as f64 + f64::from(px) / f64::from(ew) * (b.max_x - b.min_x) as f64,
+            b.min_y as f64 + f64::from(py) / f64::from(eh) * (b.max_y - b.min_y) as f64,
+        )
+    }
+
+    #[test]
+    fn layout_at_origin_is_unchanged() {
+        let b = LayoutBox::from_rects([(0, 0, 1280, 720), (1280, 0, 1280, 720)]).unwrap();
+        assert_eq!(b.extents(), (2560, 720));
+        assert_eq!(b.map_point(100, 100), (100, 100));
+        assert_eq!(b.map_point(2000, 700), (2000, 700));
+        assert_eq!(wlroots_lands_at(&b, 1500, 300), (1500.0, 300.0));
+    }
+
+    #[test]
+    fn negative_x_left_monitor_is_reachable() {
+        // X11-1 at 0,0 (1280x720 logical), X11-2 at -1280,0.
+        let b = LayoutBox::from_rects([(0, 0, 1280, 720), (-1280, 0, 1280, 720)]).unwrap();
+        assert_eq!(b.extents(), (2560, 720));
+        assert_eq!(b.map_point(100, 100), (1380, 100));
+        assert_eq!(b.map_point(-1280, 0), (0, 0));
+        assert_eq!(b.map_point(-1, 719), (1279, 719));
+        assert_eq!(wlroots_lands_at(&b, 100, 100), (100.0, 100.0));
+        assert_eq!(wlroots_lands_at(&b, -640, 360), (-640.0, 360.0));
+        assert_eq!(wlroots_lands_at(&b, 1279, 719), (1279.0, 719.0));
+    }
+
+    #[test]
+    fn vertical_offset_second_output() {
+        // X11-2 at 1280,200: box height is 920, y maps 1:1.
+        let b = LayoutBox::from_rects([(0, 0, 1280, 720), (1280, 200, 1280, 720)]).unwrap();
+        assert_eq!(b.extents(), (2560, 920));
+        assert_eq!(b.map_point(1300, 900), (1300, 900));
+        assert_eq!(wlroots_lands_at(&b, 1300, 900), (1300.0, 900.0));
+        // Output above the origin: negative y is reachable.
+        let b = LayoutBox::from_rects([(0, 0, 1280, 720), (0, -720, 1280, 720)]).unwrap();
+        assert_eq!(b.map_point(10, -700), (10, 20));
+        assert_eq!(wlroots_lands_at(&b, 10, -700), (10.0, -700.0));
+    }
+
+    #[test]
+    fn gap_layout_maps_exactly() {
+        // 200px gap between outputs: the box spans it; points on either side
+        // map 1:1.
+        let b = LayoutBox::from_rects([(0, 0, 1280, 720), (1480, 0, 1280, 720)]).unwrap();
+        assert_eq!(b.extents(), (2760, 720));
+        assert_eq!(wlroots_lands_at(&b, 1500, 10), (1500.0, 10.0));
+        assert_eq!(wlroots_lands_at(&b, 1279, 10), (1279.0, 10.0));
+    }
+
+    #[test]
+    fn clamps_to_last_pixel() {
+        let b = LayoutBox::from_rects([(-1280, 0, 1280, 720), (0, 0, 1280, 720)]).unwrap();
+        assert_eq!(b.map_point(-5000, -5), (0, 0));
+        assert_eq!(b.map_point(5000, 5000), (2559, 719));
+        assert!(LayoutBox::from_rects(std::iter::empty()).is_none());
     }
 }

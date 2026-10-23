@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Pointer on layouts that do not start at `(0,0)`.** Absolute motion now maps
+  onto the layout's bounding box with its real origin (`x - min_x`,
+  `y - min_y`, extents `max - min`, clamped to `extent - 1`), which is how
+  wlroots' `wlr_cursor` interprets `motion_absolute`. Before, the extent was the
+  right/bottom edge and negative coordinates clamped to 0, so a monitor left of
+  or above the origin was unreachable and every point landed shifted by the
+  negative offset.
+- **Screenshots of rotated or flipped outputs.** Capture reads
+  `wl_output.transform` and re-orients the screencopy buffer (after undoing
+  y-invert) to the output's logical orientation for all eight transforms, so
+  the image size and content match `screens`; `zoom` crops the right region.
+  `screens` computes the fractional `scale` from the transform-swapped mode, so
+  a rotated unscaled output reports 1.0 instead of e.g. 1.78.
+
 ## [0.1.0] - 2026-07-06
 
 Initial experimental release. First-party wlroots-Wayland backend for Claude

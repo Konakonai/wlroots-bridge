@@ -5,6 +5,7 @@ mod doctor;
 mod input;
 mod output;
 mod screens;
+mod transform;
 mod wm;
 
 use std::process::ExitCode;

@@ -15,6 +15,14 @@
 //! physical pixels, so a fractional-scaled output needs the crop scaled by the
 //! same physical/logical ratio; we compute it from the buffer size vs the
 //! output's logical size.
+//!
+//! ## Output transforms
+//!
+//! The screencopy buffer is in *buffer* orientation (the untransformed panel
+//! mode). For a rotated or flipped output we first undo the frame's y-invert
+//! flag, then apply the `wl_output.transform` (see `crate::transform`) so the
+//! image matches the output's logical orientation and size - the orientation
+//! `screens` reports and the pointer coordinates use, and what grim produces.
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -29,6 +37,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 use crate::conn::Conn;
 use crate::output::{ScreenshotCapture, ScreenshotResult};
 use crate::screens::{self, OutputGeometry};
+use crate::transform::Transform;
 
 /// Long-edge cap on the encoded image, in physical pixels. Mirrors x11-bridge.
 pub const MAX_LONG_EDGE: u32 = 1568;
@@ -270,7 +279,8 @@ unsafe extern "C" {
     fn memfd_create(name: *const core::ffi::c_char, flags: core::ffi::c_uint) -> i32;
 }
 
-/// Capture a full output's pixels as packed RGB, plus its physical dimensions.
+/// Capture a full output's pixels as packed RGB in the output's logical
+/// orientation, plus those (transformed, physical-pixel) dimensions.
 fn capture_output_rgb(conn: &Conn, geom: &OutputGeometry) -> Result<(RgbImage, u32, u32)> {
     // Re-enumerate to get the live wl_output proxy for the target output.
     let entries = screens::enumerate(conn)?;
@@ -326,7 +336,9 @@ fn capture_output_rgb(conn: &Conn, geom: &OutputGeometry) -> Result<(RgbImage, u
 
     let data = shm_buffer.mmap.as_slice();
     let rgb = decode_shm(data, fmt, state.y_invert)?;
-    Ok((rgb, fmt.width, fmt.height))
+    let rgb = apply_output_transform(rgb, entry.transform);
+    let (w, h) = (rgb.width, rgb.height);
+    Ok((rgb, w, h))
 }
 
 /// Capture a full monitor. `display` selects the monitor (default: primary).
@@ -439,6 +451,29 @@ fn decode_shm(data: &[u8], fmt: BufferFormat, y_invert: bool) -> Result<RgbImage
         height: fmt.height,
         pixels,
     })
+}
+
+/// Re-orient a buffer-oriented image to the output's logical orientation.
+fn apply_output_transform(src: RgbImage, transform: Transform) -> RgbImage {
+    if transform == Transform::Normal {
+        return src;
+    }
+    let (bw, bh) = (src.width, src.height);
+    let (lw, lh) = transform.transformed_size(bw, bh);
+    let mut pixels = vec![0u8; src.pixels.len()];
+    for by in 0..bh {
+        for bx in 0..bw {
+            let (lx, ly) = transform.buffer_to_logical(bx, by, bw, bh);
+            let s = ((by * bw + bx) as usize) * 3;
+            let d = ((ly * lw + lx) as usize) * 3;
+            pixels[d..d + 3].copy_from_slice(&src.pixels[s..s + 3]);
+        }
+    }
+    RgbImage {
+        width: lw,
+        height: lh,
+        pixels,
+    }
 }
 
 /// Crop a packed-RGB image to `(x, y, w, h)`, clamping to the image bounds.
@@ -725,5 +760,73 @@ mod tests {
         };
         let out = resize_area_average(&src, 1, 1);
         assert_eq!(out.pixels, vec![127, 127, 127]);
+    }
+
+    /// A 3x2 buffer whose pixel values encode their buffer position:
+    /// [a b c]
+    /// [d e f]   (each pixel = [index, 0, 0]).
+    fn labelled_3x2() -> RgbImage {
+        let mut pixels = Vec::new();
+        for i in 0..6u8 {
+            pixels.extend_from_slice(&[i, 0, 0]);
+        }
+        RgbImage {
+            width: 3,
+            height: 2,
+            pixels,
+        }
+    }
+
+    fn labels(img: &RgbImage) -> Vec<u8> {
+        img.pixels.chunks(3).map(|p| p[0]).collect()
+    }
+
+    #[test]
+    fn output_transform_all_eight() {
+        // Expected logical images (row-major labels) for buffer
+        //   0 1 2
+        //   3 4 5
+        // following wlroots wlr_box_transform(T) on the buffer.
+        let cases: [(Transform, (u32, u32), [u8; 6]); 8] = [
+            (Transform::Normal, (3, 2), [0, 1, 2, 3, 4, 5]),
+            // 90: rotate clockwise.
+            (Transform::Rot90, (2, 3), [3, 0, 4, 1, 5, 2]),
+            (Transform::Rot180, (3, 2), [5, 4, 3, 2, 1, 0]),
+            // 270: rotate counter-clockwise.
+            (Transform::Rot270, (2, 3), [2, 5, 1, 4, 0, 3]),
+            // flipped: mirror around the vertical axis.
+            (Transform::Flipped, (3, 2), [2, 1, 0, 5, 4, 3]),
+            // flipped-90: transpose.
+            (Transform::Flipped90, (2, 3), [0, 3, 1, 4, 2, 5]),
+            // flipped-180: mirror around the horizontal axis.
+            (Transform::Flipped180, (3, 2), [3, 4, 5, 0, 1, 2]),
+            // flipped-270: anti-transpose.
+            (Transform::Flipped270, (2, 3), [5, 2, 4, 1, 3, 0]),
+        ];
+        for (t, dims, expected) in cases {
+            let out = apply_output_transform(labelled_3x2(), t);
+            assert_eq!((out.width, out.height), dims, "{t:?} dims");
+            assert_eq!(labels(&out), expected.to_vec(), "{t:?} pixels");
+        }
+    }
+
+    #[test]
+    fn y_invert_is_undone_before_the_output_transform() {
+        // 1x2 buffer stored bottom-up (y_invert): memory row0 = green, row1 =
+        // red, so the true buffer is red-over-green. Rot90 of a 1x2 red/green
+        // column is a 2x1 row [green, red] (clockwise: bottom goes left).
+        let data = [
+            0x00, 0xFF, 0x00, 0xFF, // memory row0 = green (BGRx)
+            0x00, 0x00, 0xFF, 0xFF, // memory row1 = red
+        ];
+        let fmt = BufferFormat {
+            format: wl_shm::Format::Xrgb8888,
+            width: 1,
+            height: 2,
+            stride: 4,
+        };
+        let img = apply_output_transform(decode_shm(&data, fmt, true).unwrap(), Transform::Rot90);
+        assert_eq!((img.width, img.height), (2, 1));
+        assert_eq!(img.pixels, vec![0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00]);
     }
 }

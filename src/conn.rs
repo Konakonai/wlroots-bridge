@@ -39,6 +39,9 @@ pub struct OutputEntry {
     pub mode_height: Option<i32>,
     /// Refresh rate in mHz from wl_output.mode.
     pub refresh_millihz: Option<u32>,
+    /// Output transform from wl_output.geometry. The mode (and the screencopy
+    /// buffer) is in untransformed buffer orientation; the logical size is not.
+    pub transform: crate::transform::Transform,
 }
 
 /// A bound global: its `wl_registry` name and the version we bound at.
