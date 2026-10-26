@@ -16,6 +16,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Screencopy wait is a 2 s wall-clock deadline, not 200 roundtrips.** Each
+  roundtrip returns as soon as the compositor answers its sync request, before
+  a frame is rendered, so the old wait ended too early for compositors that
+  copy into the buffer on their next rendered frame (Hyprland at 4K, others
+  under load) and failed with "screencopy did not complete (no ready event)". The bridge now polls the
+  Wayland socket until `ready`, `failed` or 2 s; a compositor that answers at
+  once still returns at once, only the upper bound grows. The timeout error
+  reports the elapsed milliseconds.
 - **Pointer on layouts that do not start at `(0,0)`.** Absolute motion now maps
   onto the layout's bounding box with its real origin (`x - min_x`,
   `y - min_y`, extents `max - min`, clamped to `extent - 1`), which is how

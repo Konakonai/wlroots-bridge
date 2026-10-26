@@ -27,9 +27,11 @@
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
+use std::time::{Duration, Instant};
+use wayland_client::backend::WaylandError;
 use wayland_client::protocol::{wl_buffer, wl_shm, wl_shm_pool};
-use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
 };
@@ -279,6 +281,75 @@ unsafe extern "C" {
     fn memfd_create(name: *const core::ffi::c_char, flags: core::ffi::c_uint) -> i32;
 }
 
+/// Upper bound for the compositor to deliver `ready` after `copy`.
+const COPY_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const POLLIN: i16 = 0x001;
+
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, nfds: core::ffi::c_ulong, timeout: i32) -> i32;
+}
+
+/// Dispatch events until the frame is `ready` or `failed`, or `timeout`
+/// elapses. Returns true when the frame completed (ready), false on timeout or
+/// failure (the caller tells them apart through `state.failed`). Checks the
+/// state before any blocking, so an already-delivered event costs no wait.
+fn wait_for_frame(
+    conn: &Connection,
+    queue: &mut EventQueue<CaptureState>,
+    state: &mut CaptureState,
+    timeout: Duration,
+) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        queue.dispatch_pending(state)?;
+        if state.ready || state.failed {
+            return Ok(state.ready);
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(false);
+        };
+        conn.flush()?;
+        // None means events are already queued: loop to dispatch them.
+        let Some(guard) = queue.prepare_read() else {
+            continue;
+        };
+        let mut pfd = PollFd {
+            fd: guard.connection_fd().as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        };
+        // Round up so a sub-millisecond remainder cannot spin.
+        let ms = remaining.as_millis().min((i32::MAX - 1) as u128) as i32 + 1;
+        // SAFETY: `pfd` is a valid, initialised pollfd for the duration of the call.
+        let n = unsafe { poll(&mut pfd, 1, ms) };
+        if n > 0 {
+            match guard.read() {
+                Ok(_) => {}
+                // A read that yielded only a partial message: wait for more.
+                Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+        } else if n < 0 {
+            let err = std::io::Error::last_os_error();
+            drop(guard);
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err).context("poll on the Wayland socket failed");
+            }
+        } else {
+            // Timeout: drop the guard (cancels the read) and re-check the deadline.
+            drop(guard);
+        }
+    }
+}
+
 /// Capture a full output's pixels as packed RGB in the output's logical
 /// orientation, plus those (transformed, physical-pixel) dimensions.
 fn capture_output_rgb(conn: &Conn, geom: &OutputGeometry) -> Result<(RgbImage, u32, u32)> {
@@ -318,20 +389,21 @@ fn capture_output_rgb(conn: &Conn, geom: &OutputGeometry) -> Result<(RgbImage, u
     let shm_buffer = ShmBuffer::new(&shm, &qh, fmt)?;
     frame.copy(&shm_buffer.buffer);
 
-    // Pump until ready or failed.
-    for _ in 0..200 {
-        queue
-            .roundtrip(&mut state)
-            .context("failed a screencopy copy roundtrip")?;
-        if state.ready || state.failed {
-            break;
-        }
-    }
+    // Wait until ready or failed. Some compositors (Hyprland at 4K, others
+    // under load) copy into the buffer on their next rendered frame, which can
+    // be well after a sync roundtrip returns. Wait on the socket against a
+    // wall-clock deadline; a compositor that answers at once returns at once.
+    let started = Instant::now();
+    let outcome = wait_for_frame(&conn.conn, &mut queue, &mut state, COPY_TIMEOUT)
+        .context("failed a screencopy copy roundtrip")?;
     if state.failed {
         bail!("compositor reported screencopy failure for the output");
     }
-    if !state.ready {
-        bail!("screencopy did not complete (no ready event)");
+    if !outcome {
+        bail!(
+            "screencopy did not complete (no ready event after {} ms)",
+            started.elapsed().as_millis()
+        );
     }
 
     let data = shm_buffer.mmap.as_slice();
