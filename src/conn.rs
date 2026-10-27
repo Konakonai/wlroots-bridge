@@ -68,6 +68,10 @@ pub struct Globals {
     pub outputs: Vec<BoundGlobal>,
 }
 
+/// How long [`Conn::settle`] leaves clients to bind a newly added seat
+/// capability.
+const SETTLE_MS: u64 = 50;
+
 /// Shared connection + a live registry + the discovered globals.
 pub struct Conn {
     pub conn: Connection,
@@ -104,6 +108,21 @@ impl Conn {
             registry,
             globals: state.globals,
         })
+    }
+
+    /// Wait until the compositor has processed every request sent so far,
+    /// then give clients a moment to react. A freshly created virtual input
+    /// device can add a seat capability (sway drops pointer and keyboard
+    /// whenever no such device exists); clients only re-bind wl_pointer /
+    /// wl_keyboard after seeing it, so events sent in the same burst as the
+    /// device's creation reach nobody.
+    pub fn settle(&self) -> Result<()> {
+        let mut queue = self.conn.new_event_queue::<()>();
+        queue
+            .roundtrip(&mut ())
+            .context("failed the device settle roundtrip")?;
+        std::thread::sleep(std::time::Duration::from_millis(SETTLE_MS));
+        Ok(())
     }
 
     /// The list of advertised `wl_output` globals, most-recently-added last.

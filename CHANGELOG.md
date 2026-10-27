@@ -16,6 +16,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **First input of each command lost on Sway without physical devices.** Sway
+  advertises a seat's pointer/keyboard capability only while a device provides
+  it, so in a headless or nested session the bridge's fresh virtual device is
+  what adds it, and clients had not bound `wl_pointer` / `wl_keyboard` yet when
+  the events arrived: clicks did nothing and `type` dropped its first
+  character. The bridge now does a roundtrip and waits 50 ms after creating a
+  virtual pointer or keyboard.
 - **Screencopy wait is a 2 s wall-clock deadline, not 200 roundtrips.** Each
   roundtrip returns as soon as the compositor answers its sync request, before
   a frame is rendered, so the old wait ended too early for compositors that

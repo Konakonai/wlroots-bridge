@@ -174,6 +174,7 @@ impl Pointer {
         let manager = conn.bind_virtual_pointer_manager(qh)?;
         // No seat hint: the compositor assigns a default seat.
         let pointer = manager.create_virtual_pointer(None, qh, ());
+        conn.settle()?;
         Ok(Self { pointer, layout })
     }
 

@@ -112,6 +112,18 @@ keyname  := <CU key-name from table> | <single literal char>
   `pageup`/`page_up`->`Prior`, `pagedown`/`page_down`->`Next`,
   `capslock`->`Caps_Lock`. Anything else passes through as a keysym by char/name.
 
+## New virtual devices
+
+Every command creates its virtual pointer or keyboard afresh, and the device
+lives only as long as the process. On Sway a seat advertises the pointer and
+keyboard capabilities only while some device provides them; with no physical
+input (headless, nested, a seat without hardware) the new device is what adds
+the capability, and clients bind `wl_pointer` / `wl_keyboard` only after they
+see it. Events sent in the same burst as the device's creation therefore reach
+nobody. After creating a device (and, for the keyboard, uploading the keymap)
+the bridge does a roundtrip and waits 50 ms (`Conn::settle`) before sending
+events, so a one-shot command costs that much more.
+
 ## Keymap generation
 
 The `zwp_virtual_keyboard_v1` protocol requires uploading an XKB keymap fd

@@ -62,6 +62,7 @@ impl Keyboard {
         bytes.push(0); // xkbcommon expects a NUL terminator
         let file = write_memfd(&bytes)?;
         kb.keymap(XKB_V1, file.as_fd(), bytes.len() as u32);
+        conn.settle()?;
 
         Ok(Self { kb, keymap })
     }
