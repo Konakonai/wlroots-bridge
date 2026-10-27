@@ -9,12 +9,14 @@
 //!    `type`), build a keymap binding them + the four modifier keys to
 //!    sequential keycodes,
 //! 2. write the text to a memfd, upload it via `keymap`,
-//! 3. press modifiers (real keycodes, driven via `modifier_map`), tap the base
-//!    key(s), release in reverse.
+//! 3. press modifiers (real keycodes, driven via `modifier_map`, with the
+//!    depressed mask reported through `modifiers`), tap the base key(s),
+//!    release in reverse.
 //!
 //! `key` events carry Linux evdev codes (XKB keycode - 8), which is exactly what
 //! `generate_keymap` returns in each placement's `evdev_code`.
 
+use std::cell::Cell;
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::thread;
@@ -47,6 +49,8 @@ wayland_client::delegate_noop!(KeyboardState: ignore wayland_client::protocol::w
 struct Keyboard {
     kb: zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
     keymap: GeneratedKeymap,
+    /// Depressed modifier mask last sent with `modifiers`.
+    mods: Cell<u32>,
 }
 
 impl Keyboard {
@@ -64,12 +68,35 @@ impl Keyboard {
         kb.keymap(XKB_V1, file.as_fd(), bytes.len() as u32);
         conn.settle()?;
 
-        Ok(Self { kb, keymap })
+        Ok(Self {
+            kb,
+            keymap,
+            mods: Cell::new(0),
+        })
     }
 
     fn key(&self, evdev_code: u32, pressed: bool) {
         let state = if pressed { KEY_PRESSED } else { KEY_RELEASED };
         self.kb.key(now_ms(), evdev_code, state);
+
+        // wlroots (Sway) does not derive modifier state from a virtual
+        // keyboard's key events; the client has to report it, or `ctrl+c`
+        // arrives as a plain `c`. Real-modifier bits follow the generated
+        // keymap's modifier_map (Shift, Control, Mod1, Mod4).
+        let bit = match evdev_code {
+            c if c == self.keymap.shift_code => 1 << 0,
+            c if c == self.keymap.ctrl_code => 1 << 2,
+            c if c == self.keymap.alt_code => 1 << 3,
+            c if c == self.keymap.super_code => 1 << 6,
+            _ => return,
+        };
+        let mods = if pressed {
+            self.mods.get() | bit
+        } else {
+            self.mods.get() & !bit
+        };
+        self.mods.set(mods);
+        self.kb.modifiers(mods, 0, 0, 0);
     }
 }
 

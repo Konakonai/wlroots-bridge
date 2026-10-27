@@ -137,8 +137,12 @@ XKB keymap text ourselves** (the wtype technique, hand-rolled in
   keysym.
 - Each requested keysym is bound at **both** shift levels of its keycode to the
   exact glyph, so a stray Shift never corrupts it. Modifiers are driven as real
-  keys (wtype's approach), not via the `modifiers()` bitmask - it is more
-  reliable across Sway/Hyprland/Niri.
+  keys, and every modifier press or release also sends the depressed real-mod
+  mask with `modifiers()` (Shift `0x1`, Control `0x4`, Mod1 `0x8`, Mod4
+  `0x40`, matching the generated `modifier_map`), as wtype does. wlroots (Sway)
+  passes virtual-keyboard keys on with `update_state = false`, so it never
+  derives modifier state from them; without the mask `ctrl+c` reaches the
+  client as a plain `c`.
 - Named keys use their X keysym name (`Return`, `space`, `F5`); Latin-1 glyphs
   their name (`eacute`) or `U00E9`; CJK/emoji the Unicode symbol name
   (`U597D`, `U1F600`) via the keysym encoding `0x01000000 | codepoint`.

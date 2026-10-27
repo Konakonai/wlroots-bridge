@@ -16,6 +16,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Modifiers on Sway.** wlroots does not derive modifier state from a virtual
+  keyboard's key events, so `key-sequence ctrl+c`, `hold-key` and
+  `pointer-click --modifier` delivered the bare key or click. The keyboard now
+  sends `modifiers()` with the depressed mask whenever a modifier key goes down
+  or up.
 - **First input of each command lost on Sway without physical devices.** Sway
   advertises a seat's pointer/keyboard capability only while a device provides
   it, so in a headless or nested session the bridge's fresh virtual device is
